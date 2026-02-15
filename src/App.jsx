@@ -88,6 +88,7 @@ const api = {
   updateAccount: (id, d) => api.call("PUT", `/accounts/${id}`, d),
   deleteAccount: (id) => api.call("DELETE", `/accounts/${id}`),
   getTransactions: (p = "") => api.call("GET", `/transactions?${p}`),
+  getSummary: (p = "") => api.call("GET", `/transactions/summary?${p}`),
   createTransaction: (d) => api.call("POST", "/transactions", d),
   updateTransaction: (id, d) => api.call("PUT", `/transactions/${id}`, d),
   deleteTransaction: (id) => api.call("DELETE", `/transactions/${id}`),
@@ -271,43 +272,47 @@ function TransactionsTab({ accounts, toast }) {
   const [showImport, setShowImport] = useState(false);
   const [editTx, setEditTx] = useState(null);
   const [showFilters, setShowFilters] = useState(false);
+  const [periodTotals, setPeriodTotals] = useState({ income: 0, expense: 0 });
+
+  // Build date params for both transactions and summary
+  const dateParams = useMemo(() => {
+    if (month !== null) {
+      const { start, end } = getMonthRange(fy, month);
+      return `start_date=${start}&end_date=${end}`;
+    }
+    const { start, end } = getFYRange(fy);
+    return `start_date=${start}&end_date=${end}`;
+  }, [fy, month]);
 
   const fetchTxns = useCallback(async () => {
     setLoading(true);
     try {
-      let params = `page=${page}&limit=30&sort_by=date&sort_order=DESC`;
+      let params = `page=${page}&limit=30&sort_by=date&sort_order=DESC&${dateParams}`;
       if (search) params += `&search=${encodeURIComponent(search)}`;
       if (filterAcc) params += `&account_id=${filterAcc}`;
-      if (month !== null) {
-        const { start, end } = getMonthRange(fy, month);
-        params += `&start_date=${start}&end_date=${end}`;
-      } else {
-        const { start, end } = getFYRange(fy);
-        params += `&start_date=${start}&end_date=${end}`;
-      }
       const data = await api.getTransactions(params);
       setTxns(data.transactions || []);
       setTotal(data.pagination?.total || 0);
     } catch (e) { toast(e.message, "error"); }
     setLoading(false);
-  }, [page, search, filterAcc, fy, month, toast]);
+  }, [page, search, filterAcc, dateParams, toast]);
+
+  // Fetch period summary (income/expense totals) from backend
+  const fetchSummary = useCallback(async () => {
+    try {
+      const data = await api.getSummary(dateParams);
+      setPeriodTotals({ income: data.income || 0, expense: data.expense || 0 });
+    } catch {}
+  }, [dateParams]);
 
   useEffect(() => { fetchTxns(); }, [fetchTxns]);
+  useEffect(() => { fetchSummary(); }, [fetchSummary]);
   useEffect(() => { setPage(1); }, [fy, month, filterAcc, search]);
 
   const handleDelete = async (id) => {
     if (!confirm("Delete this transaction?")) return;
-    try { await api.deleteTransaction(id); toast("Deleted", "success"); fetchTxns(); } catch (e) { toast(e.message, "error"); }
+    try { await api.deleteTransaction(id); toast("Deleted", "success"); fetchTxns(); fetchSummary(); } catch (e) { toast(e.message, "error"); }
   };
-
-  const periodTotals = useMemo(() => {
-    let inc = 0, exp = 0;
-    txns.forEach(tx => {
-      if (tx.credit_account_type === "Income") inc += parseFloat(tx.amount);
-      if (tx.debit_account_type === "Expense") exp += parseFloat(tx.amount);
-    });
-    return { income: inc, expense: exp };
-  }, [txns]);
 
   // Group transactions by date for display
   const groupedByDate = useMemo(() => {
@@ -429,7 +434,7 @@ function TransactionsTab({ accounts, toast }) {
         </div>
       )}
 
-      <TransactionModal open={showModal} onClose={() => { setShowModal(false); setEditTx(null); }} accounts={accounts} editTx={editTx} onSave={() => { setShowModal(false); setEditTx(null); fetchTxns(); }} toast={toast} />
+      <TransactionModal open={showModal} onClose={() => { setShowModal(false); setEditTx(null); }} accounts={accounts} editTx={editTx} onSave={() => { setShowModal(false); setEditTx(null); fetchTxns(); fetchSummary(); }} toast={toast} />
       <ImportModal open={showImport} onClose={() => setShowImport(false)} onSuccess={() => { setShowImport(false); fetchTxns(); }} toast={toast} />
     </div>
   );
