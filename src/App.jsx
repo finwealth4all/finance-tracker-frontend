@@ -826,7 +826,12 @@ function ImportModal({open,onClose,onSuccess,toast,accounts}) {
         </div>
 
         {(isPdf||password)&&(
-          <Inp label="PDF Password (if protected)" type="password" placeholder="Leave empty if not password-protected" value={password} onChange={e=>setPassword(e.target.value)}/>
+          <div style={{marginBottom:14}}>
+            <Inp label="PDF Password *" type="password" placeholder="Enter your statement password" value={password} onChange={e=>setPassword(e.target.value)}/>
+            <div style={{fontSize:10,color:T.textTer,marginTop:2,lineHeight:1.5}}>
+              💡 Common bank PDF passwords: <strong>Date of birth</strong> (DDMMYYYY), <strong>Account number</strong>, <strong>PAN card</strong>, or <strong>last 4 digits of account + DOB</strong>. Check your bank's email for the password hint.
+            </div>
+          </div>
         )}
 
         <div style={{background:T.infoBg,borderRadius:T.rs,padding:12,marginBottom:14,fontSize:11,color:T.info,lineHeight:1.6}}>
