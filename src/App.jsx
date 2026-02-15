@@ -83,6 +83,13 @@ const api = {
   getFIRE: (p="") => api.call("GET",`/analytics/fire?${p}`),
   getTaxSummary: (fy) => api.call("GET",`/analytics/tax-summary${fy?`?financial_year=${fy}`:""}`),
   importCSV: (fd) => { const h={}; if(api.token) h["Authorization"]=`Bearer ${api.token}`; return fetch(`${API}/transactions/import-csv`,{method:"POST",headers:h,body:fd}).then(r=>r.json()); },
+  // Smart statement import
+  importUpload: (fd) => { const h={}; if(api.token) h["Authorization"]=`Bearer ${api.token}`; return fetch(`${API}/import/upload`,{method:"POST",headers:h,body:fd}).then(r=>{if(!r.ok) return r.json().then(d=>{throw new Error(d.error||'Upload failed')});return r.json()}); },
+  getStaged: (batchId) => api.call("GET",`/import/staged${batchId?`?batch_id=${batchId}`:""}`),
+  updateStaged: (id,data) => api.call("PUT",`/import/staged/${id}`,data),
+  updateStagedBulk: (ids,updates) => api.call("PUT","/import/staged-bulk",{ids,updates}),
+  confirmImport: (batchId) => api.call("POST","/import/confirm",{batch_id:batchId}),
+  clearStaged: (batchId) => api.call("DELETE",`/import/staged${batchId?`?batch_id=${batchId}`:""}`),
 };
 
 // ============================================================
@@ -659,7 +666,7 @@ function TransactionsTab({accounts,toast,initialAccountId}) {
       </Modal>
 
       <TransactionModal open={showModal} onClose={()=>{setShowModal(false);setEditTx(null)}} accounts={accounts} editTx={editTx} onSave={()=>{setShowModal(false);setEditTx(null);fetchTxns();fetchSummary()}} toast={toast}/>
-      <ImportModal open={showImport} onClose={()=>setShowImport(false)} onSuccess={()=>{setShowImport(false);fetchTxns();fetchSummary()}} toast={toast}/>
+      <ImportModal open={showImport} onClose={()=>setShowImport(false)} onSuccess={()=>{setShowImport(false);fetchTxns();fetchSummary()}} toast={toast} accounts={accounts}/>
     </div>
   );
 }
@@ -715,33 +722,258 @@ function TransactionModal({open,onClose,accounts,editTx,onSave,toast}) {
 // ============================================================
 // CSV IMPORT MODAL
 // ============================================================
-function ImportModal({open,onClose,onSuccess,toast}) {
+function ImportModal({open,onClose,onSuccess,toast,accounts}) {
+  const [step,setStep]=useState(1); // 1=Upload, 2=Review, 3=Done
   const [file,setFile]=useState(null);
+  const [password,setPassword]=useState("");
+  const [sourceAccount,setSourceAccount]=useState("");
   const [loading,setLoading]=useState(false);
+  const [batchId,setBatchId]=useState(null);
+  const [staged,setStaged]=useState([]);
   const [result,setResult]=useState(null);
+  const [selected,setSelected]=useState(new Set());
+  const [editingId,setEditingId]=useState(null);
+  const [bulkCat,setBulkCat]=useState("");
+  const [showBulkPanel,setShowBulkPanel]=useState(false);
+  const [parseInfo,setParseInfo]=useState(null);
+  const fileRef=useRef(null);
+
+  // Reset on open
+  useEffect(()=>{if(open){setStep(1);setFile(null);setPassword("");setSourceAccount("");setBatchId(null);setStaged([]);setResult(null);setSelected(new Set());setEditingId(null);setParseInfo(null)}},[open]);
+
+  const accOpts=useMemo(()=>{
+    const grouped={};
+    (accounts||[]).forEach(a=>{if(!grouped[a.account_type])grouped[a.account_type]=[];grouped[a.account_type].push(a)});
+    return [{value:"",label:"Select source account"},...Object.entries(grouped).flatMap(([type,accs])=>[{value:`__${type}`,label:`── ${type} ──`,disabled:true},...accs.sort((a,b)=>a.account_name.localeCompare(b.account_name)).map(a=>({value:a.account_id,label:`  ${a.account_name}`}))])];
+  },[accounts]);
+
+  const categories=["Uncategorized","Food","Grocery","Shopping","Travel","Fuel","Subscription","Utilities","Telecom","Insurance","Medical","Housing","EMI Payment","Salary","Interest","Dividend","Transfer","Tax","Education","Entertainment","Donation","Maintenance","Bank Charges","Miscellaneous"];
+
+  // Step 1: Upload & Parse
   const handleUpload=async()=>{
-    if(!file){toast("Select a CSV file","error");return}setLoading(true);
-    try{const fd=new FormData();fd.append("file",file);const data=await api.importCSV(fd);setResult(data);if(data.imported>0)toast(`Imported ${data.imported} transactions!`,"success");else toast(data.error||"No transactions imported","error")}catch(e){toast(e.message,"error")}setLoading(false);
+    if(!file){toast("Select a file","error");return}
+    if(!sourceAccount){toast("Select the source bank/CC account","error");return}
+    setLoading(true);
+    try{
+      const fd=new FormData();
+      fd.append("file",file);
+      if(password) fd.append("password",password);
+      fd.append("source_account_id",sourceAccount);
+      const data=await api.importUpload(fd);
+      setBatchId(data.batch_id);
+      setParseInfo(data);
+      // Fetch staged transactions
+      const rows=await api.getStaged(data.batch_id);
+      setStaged(rows);
+      setStep(2);
+      toast(`Parsed ${data.total_parsed} transactions!`,"success");
+    }catch(e){toast(e.message,"error")}
+    setLoading(false);
   };
+
+  // Step 2: Review helpers
+  const updateRow=async(id,updates)=>{
+    try{
+      await api.updateStaged(id,updates);
+      setStaged(prev=>prev.map(r=>r.id===id?{...r,...updates}:r));
+    }catch(e){toast(e.message,"error")}
+  };
+  const rejectRow=(id)=>updateRow(id,{status:'rejected'});
+  const rejectSelected=async()=>{
+    if(selected.size===0)return;
+    try{await api.updateStagedBulk([...selected],{status:'rejected'});setStaged(prev=>prev.map(r=>selected.has(r.id)?{...r,status:'rejected'}:r));setSelected(new Set());toast(`Rejected ${selected.size}`,"info")}catch(e){toast(e.message,"error")}
+  };
+  const bulkCategoryApply=async()=>{
+    if(!bulkCat||selected.size===0)return;
+    try{await api.updateStagedBulk([...selected],{suggested_category:bulkCat});setStaged(prev=>prev.map(r=>selected.has(r.id)?{...r,suggested_category:bulkCat}:r));setSelected(new Set());setBulkCat("");setShowBulkPanel(false);toast(`Updated ${selected.size}`,"success")}catch(e){toast(e.message,"error")}
+  };
+  const toggleSel=(id)=>setSelected(p=>{const n=new Set(p);n.has(id)?n.delete(id):n.add(id);return n});
+  const selectAllActive=()=>{const active=staged.filter(r=>r.status!=='rejected');if(selected.size===active.length)setSelected(new Set());else setSelected(new Set(active.map(r=>r.id)))};
+
+  // Step 3: Confirm import
+  const handleConfirm=async()=>{
+    setLoading(true);
+    try{
+      const data=await api.confirmImport(batchId);
+      setResult(data);
+      setStep(3);
+      toast(`Imported ${data.imported} transactions!`,"success");
+    }catch(e){toast(e.message,"error")}
+    setLoading(false);
+  };
+
+  const activeCount=staged.filter(r=>r.status!=='rejected').length;
+  const withAccounts=staged.filter(r=>r.status!=='rejected'&&r.suggested_debit_account_id&&r.suggested_credit_account_id).length;
+  const highConf=staged.filter(r=>r.status!=='rejected'&&r.confidence>=0.5).length;
+  const isPdf=file?.name?.toLowerCase().endsWith('.pdf');
+
   return (
-    <Modal open={open} onClose={()=>{onClose();setFile(null);setResult(null)}} title="Import CSV">
-      <div style={{fontSize:12,color:T.textSec,marginBottom:16,lineHeight:1.6}}>Upload a CSV with columns: <strong>Date, Amount, Description, Debit Account, Credit Account, Category</strong>.</div>
-      <div style={{border:`2px dashed ${T.border}`,borderRadius:T.r,padding:28,textAlign:"center",marginBottom:16,background:T.accentLight}}>
-        <div style={{marginBottom:8,color:T.textSec}}>{I.upload}</div>
-        <input type="file" accept=".csv" onChange={e=>setFile(e.target.files[0])} style={{fontSize:13,fontFamily:T.font}}/>
-        {file&&<div style={{marginTop:8,fontSize:12,color:T.success,fontWeight:500}}>✓ {file.name}</div>}
-      </div>
-      {result&&(
-        <Card style={{marginBottom:16,padding:14,fontSize:12}}>
-          {result.imported>0&&<div style={{color:T.success,fontWeight:600}}>✅ Imported: {result.imported}</div>}
-          {result.skipped>0&&<div style={{color:T.warn,marginTop:2}}>⏭ Skipped: {result.skipped}</div>}
-          {result.errors?.length>0&&<div style={{color:T.danger,marginTop:4}}>{result.errors.slice(0,3).join(", ")}</div>}
-        </Card>
-      )}
-      <div style={{display:"flex",gap:8}}>
-        <Btn v="secondary" onClick={()=>{onClose();setFile(null);setResult(null)}} style={{flex:1}}>Cancel</Btn>
-        <Btn onClick={result?.imported>0?()=>{onSuccess();setFile(null);setResult(null)}:handleUpload} loading={loading} style={{flex:2}}>{result?.imported>0?"Done":"Upload & Import"}</Btn>
-      </div>
+    <Modal open={open} onClose={()=>{if(batchId&&step===2){api.clearStaged(batchId).catch(()=>{})}onClose()}} title={step===1?"Import Statement":step===2?"Review Transactions":"Import Complete"} width={step===2?720:520}>
+
+      {/* STEP 1: Upload */}
+      {step===1&&(<div>
+        <div style={{fontSize:12,color:T.textSec,marginBottom:16,lineHeight:1.7}}>
+          Upload a <strong>bank statement</strong> or <strong>credit card statement</strong> (PDF, CSV, or Excel). Transactions will be extracted, auto-classified, and shown for your review before importing.
+        </div>
+
+        <Sel label="Source Account (which bank/card is this from?) *" value={sourceAccount} onChange={e=>setSourceAccount(e.target.value)} options={accOpts}/>
+
+        <div style={{border:`2px dashed ${file?T.success:T.border}`,borderRadius:T.r,padding:28,textAlign:"center",marginBottom:14,background:file?T.successBg:T.accentLight,cursor:"pointer",transition:"all .2s"}} onClick={()=>fileRef.current?.click()}>
+          <div style={{marginBottom:8,color:file?T.success:T.textSec,fontSize:28}}>{file?"✓":I.upload}</div>
+          <div style={{fontSize:13,fontWeight:500,color:file?T.success:T.textSec}}>{file?file.name:"Click to select file"}</div>
+          <div style={{fontSize:11,color:T.textTer,marginTop:4}}>PDF, CSV, Excel — up to 20MB</div>
+          <input ref={fileRef} type="file" accept=".pdf,.csv,.xls,.xlsx" onChange={e=>setFile(e.target.files[0])} style={{display:"none"}}/>
+        </div>
+
+        {(isPdf||password)&&(
+          <Inp label="PDF Password (if protected)" type="password" placeholder="Leave empty if not password-protected" value={password} onChange={e=>setPassword(e.target.value)}/>
+        )}
+
+        <div style={{background:T.infoBg,borderRadius:T.rs,padding:12,marginBottom:14,fontSize:11,color:T.info,lineHeight:1.6}}>
+          <strong>Supported formats:</strong> HDFC, SBI, ICICI bank statements & credit card statements. CSV/Excel from any bank with Date + Amount columns. Password-protected PDFs supported.
+        </div>
+
+        <div style={{display:"flex",gap:8}}>
+          <Btn v="secondary" onClick={onClose} style={{flex:1}}>Cancel</Btn>
+          <Btn onClick={handleUpload} loading={loading} disabled={!file||!sourceAccount} style={{flex:2}}>Upload & Parse</Btn>
+        </div>
+      </div>)}
+
+      {/* STEP 2: Review */}
+      {step===2&&(<div>
+        {/* Summary Bar */}
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr 1fr",gap:6,marginBottom:14}}>
+          {[{l:"Total",v:staged.length,c:T.text},{l:"Active",v:activeCount,c:T.success},{l:"Classified",v:highConf,c:T.info},{l:"Rejected",v:staged.length-activeCount,c:T.danger}].map(x=>(
+            <div key={x.l} style={{textAlign:"center",padding:"6px 4px",background:T.accentLight,borderRadius:T.rs}}>
+              <div style={{fontSize:9,color:T.textTer,textTransform:"uppercase",fontWeight:600}}>{x.l}</div>
+              <div style={{fontSize:16,fontWeight:700,fontFamily:T.mono,color:x.c}}>{x.v}</div>
+            </div>
+          ))}
+        </div>
+
+        {/* Bulk Actions */}
+        <div style={{display:"flex",gap:6,marginBottom:10,flexWrap:"wrap",alignItems:"center"}}>
+          <input type="checkbox" checked={selected.size===activeCount&&activeCount>0} onChange={selectAllActive} style={{accentColor:T.accent}}/>
+          <span style={{fontSize:11,color:T.textSec}}>{selected.size>0?`${selected.size} selected`:"Select all"}</span>
+          {selected.size>0&&(<>
+            <Btn v="secondary" s="sm" onClick={()=>setShowBulkPanel(!showBulkPanel)}>{I.tag} Category</Btn>
+            <Btn v="danger" s="sm" onClick={rejectSelected}>{I.trash} Reject</Btn>
+          </>)}
+        </div>
+
+        {showBulkPanel&&selected.size>0&&(
+          <div style={{display:"flex",gap:6,marginBottom:10,padding:"8px 10px",background:T.infoBg,borderRadius:T.rs,alignItems:"center"}}>
+            <select value={bulkCat} onChange={e=>setBulkCat(e.target.value)} style={{flex:1,padding:"6px 8px",borderRadius:6,border:`1px solid ${T.border}`,fontSize:12,fontFamily:T.font}}>
+              <option value="">Select category</option>
+              {categories.map(c=><option key={c} value={c}>{c}</option>)}
+            </select>
+            <Btn s="sm" onClick={bulkCategoryApply} disabled={!bulkCat}>Apply to {selected.size}</Btn>
+          </div>
+        )}
+
+        {/* Transaction List */}
+        <div style={{maxHeight:"50vh",overflowY:"auto",marginBottom:14,border:`1px solid ${T.border}`,borderRadius:T.rs}}>
+          {staged.map((tx,idx)=>{
+            const isRejected=tx.status==='rejected';
+            const isSel=selected.has(tx.id);
+            const isEditing=editingId===tx.id;
+            const confColor=tx.confidence>=0.7?T.success:tx.confidence>=0.4?T.warn:T.danger;
+            const hasAccounts=tx.suggested_debit_account_id&&tx.suggested_credit_account_id;
+
+            return (
+              <div key={tx.id} style={{padding:"8px 10px",borderBottom:`1px solid ${T.accentLight}`,opacity:isRejected?0.35:1,background:isSel?T.infoBg:isRejected?"#fafafa":"#fff",transition:"all .15s"}}>
+                <div style={{display:"flex",alignItems:"flex-start",gap:8}}>
+                  {!isRejected&&<input type="checkbox" checked={isSel} onChange={()=>toggleSel(tx.id)} style={{marginTop:3,accentColor:T.accent}}/>}
+                  {isRejected&&<span style={{fontSize:10,color:T.danger,marginTop:3}}>✕</span>}
+
+                  <div style={{flex:1,minWidth:0}}>
+                    <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",gap:6}}>
+                      <div style={{flex:1,minWidth:0}}>
+                        <div style={{display:"flex",alignItems:"center",gap:5,marginBottom:2}}>
+                          <span style={{fontSize:11,color:T.textTer,fontFamily:T.mono,flexShrink:0}}>{tx.date?.split("T")[0]}</span>
+                          <span style={{fontSize:12,fontWeight:500,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{tx.description||"—"}</span>
+                        </div>
+                        <div style={{display:"flex",gap:4,alignItems:"center",flexWrap:"wrap"}}>
+                          {!isEditing?(
+                            <Pill color={confColor} bg={`${confColor}12`}>{tx.suggested_category||"Uncategorized"}</Pill>
+                          ):(
+                            <select value={tx.suggested_category||""} onChange={e=>updateRow(tx.id,{suggested_category:e.target.value})} style={{padding:"2px 6px",borderRadius:4,border:`1px solid ${T.border}`,fontSize:10,fontFamily:T.font}}>
+                              {categories.map(c=><option key={c} value={c}>{c}</option>)}
+                            </select>
+                          )}
+                          <span style={{fontSize:9,color:confColor,fontWeight:600}}>{Math.round((tx.confidence||0)*100)}%</span>
+                          {!hasAccounts&&!isRejected&&<span style={{fontSize:9,color:T.warn,fontWeight:500}}>⚠ needs accounts</span>}
+                          <Pill color={tx.transaction_type==='credit'?T.success:T.danger}>{tx.transaction_type==='credit'?'IN':'OUT'}</Pill>
+                        </div>
+
+                        {isEditing&&!isRejected&&(
+                          <div style={{marginTop:6,display:"grid",gridTemplateColumns:"1fr 1fr",gap:4}}>
+                            <select value={tx.suggested_debit_account_id||""} onChange={e=>updateRow(tx.id,{suggested_debit_account_id:parseInt(e.target.value)||null})} style={{padding:"4px 6px",borderRadius:4,border:`1px solid ${T.border}`,fontSize:10,fontFamily:T.font}}>
+                              <option value="">To (debit)...</option>
+                              {(accounts||[]).map(a=><option key={a.account_id} value={a.account_id}>{a.account_name} ({a.account_type})</option>)}
+                            </select>
+                            <select value={tx.suggested_credit_account_id||""} onChange={e=>updateRow(tx.id,{suggested_credit_account_id:parseInt(e.target.value)||null})} style={{padding:"4px 6px",borderRadius:4,border:`1px solid ${T.border}`,fontSize:10,fontFamily:T.font}}>
+                              <option value="">From (credit)...</option>
+                              {(accounts||[]).map(a=><option key={a.account_id} value={a.account_id}>{a.account_name} ({a.account_type})</option>)}
+                            </select>
+                          </div>
+                        )}
+                      </div>
+
+                      <div style={{textAlign:"right",flexShrink:0}}>
+                        <div style={{fontSize:14,fontWeight:700,fontFamily:T.mono,color:tx.transaction_type==='credit'?T.success:T.danger}}>
+                          {tx.transaction_type==='credit'?"+":"−"}₹{fmt(tx.amount)}
+                        </div>
+                        {!isRejected&&(
+                          <div style={{display:"flex",gap:2,marginTop:3,justifyContent:"flex-end"}}>
+                            <button onClick={()=>setEditingId(isEditing?null:tx.id)} style={{background:isEditing?T.accent:T.accentLight,border:"none",borderRadius:4,padding:3,cursor:"pointer",display:"flex",color:isEditing?"#fff":T.textSec}} title="Edit">{I.edit}</button>
+                            <button onClick={()=>rejectRow(tx.id)} style={{background:T.dangerBg,border:"none",borderRadius:4,padding:3,cursor:"pointer",display:"flex",color:T.danger}} title="Reject">{I.trash}</button>
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            );
+          })}
+          {staged.length===0&&<div style={{padding:24,textAlign:"center",color:T.textSec,fontSize:12}}>No transactions found</div>}
+        </div>
+
+        {/* Confirm Bar */}
+        <div style={{display:"flex",gap:8,alignItems:"center"}}>
+          <Btn v="danger" s="sm" onClick={()=>{api.clearStaged(batchId).catch(()=>{});onClose()}}>Cancel</Btn>
+          <div style={{flex:1,textAlign:"center",fontSize:11,color:T.textSec}}>
+            <strong>{withAccounts}</strong> of {activeCount} ready to import
+          </div>
+          <Btn onClick={handleConfirm} loading={loading} disabled={withAccounts===0}>Confirm Import ({withAccounts})</Btn>
+        </div>
+      </div>)}
+
+      {/* STEP 3: Done */}
+      {step===3&&result&&(<div style={{textAlign:"center"}}>
+        <div style={{fontSize:48,marginBottom:12}}>🎉</div>
+        <div style={{fontSize:18,fontWeight:700,marginBottom:8}}>Import Complete!</div>
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,marginBottom:20}}>
+          <Card style={{padding:12,textAlign:"center"}}>
+            <div style={{fontSize:22,fontWeight:800,fontFamily:T.mono,color:T.success}}>{result.imported}</div>
+            <div style={{fontSize:11,color:T.textSec}}>Imported</div>
+          </Card>
+          <Card style={{padding:12,textAlign:"center"}}>
+            <div style={{fontSize:22,fontWeight:800,fontFamily:T.mono,color:T.warn}}>{result.skipped}</div>
+            <div style={{fontSize:11,color:T.textSec}}>Skipped</div>
+          </Card>
+        </div>
+        {result.errors?.length>0&&(
+          <div style={{fontSize:11,color:T.danger,marginBottom:12,textAlign:"left",padding:"8px 12px",background:T.dangerBg,borderRadius:T.rs}}>
+            {result.errors.map((e,i)=><div key={i}>{e}</div>)}
+          </div>
+        )}
+        <div style={{fontSize:12,color:T.textSec,marginBottom:16}}>
+          The system has learned your category preferences for future imports.
+        </div>
+        <Btn onClick={()=>{onSuccess()}} style={{width:"100%"}} s="lg">Done</Btn>
+      </div>)}
     </Modal>
   );
 }
